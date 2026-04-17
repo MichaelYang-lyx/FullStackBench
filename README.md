@@ -1,104 +1,58 @@
-<h1 style="text-align: center;">FullStack Bench: Evaluating LLMs as Full Stack Coders </h1>
+# FullStackBench
 
-<div align="center" style="margin: 2px;">
-    <a href="https://www.python.org/">
-        <img alt="Build" src="https://img.shields.io/badge/Python-3.8+-1f425f.svg?color=purple"style="display: inline-block; vertical-align: middle;"/>
-    </a>
-  <a href="" style="margin: 2px;">
-    <img alt="Code License" src="https://img.shields.io/badge/Code_License-Apache 2.0 license-f5de53%3F?color=green" style="display: inline-block; vertical-align: middle;"/>
-  </a>
-  <a href="" style="margin: 2px;">
-    <img alt="Data License" src="https://img.shields.io/badge/Data_License-CC--BY--SA--4.0-f5de53%3F?color=blue" style="display: inline-block; vertical-align: middle;"/>
-  </a>
-</div>
+## 环境配置
 
-<div style="text-align: center;">
-Official repository for our paper "FullStack Bench: Evaluating LLMs as Full Stack Coders"
-</div>
+```bash
+uv venv
+uv pip install -r requirements.txt
+```
 
-<p align="center">
-    <a href="https://github.com/bytedance/FullStackBench">🏠 FullStack Bench Code </a> •
-    <a href="https://huggingface.co/datasets/ByteDance/FullStackBench">📊 Benchmark Data </a> •
-    <a href="https://github.com/bytedance/SandboxFusion">📚 SandboxFusion </a> 
-</p>
-
-## Table of contents
-- [FullStack Bench: Evaluating LLMs as Full Stack Coders](#Introduction)
-  - [📌 Introduction](#introduction)
-  - [📚 SandboxFusion](#leaderboard)
-  - [📊 Data](#data)
-  - [💻 Usage](#usage)
-  - [📖 Citation](#citation)
-
-## 📌Introduction
-**FullStack Bench** is a multilingual benchmark for full-stack programming, covering  a wide range of application domains and **16** programming languages with **3K** test samples, which substantially pushes the limits of code LLMs in code-related abilities of the real-world code development scenarios.
-<p align="center">
-<img src="assets/intro.png" width="80%" alt="FullStack Bench" />
-</p>
-
-### Task Examples
-**FullStack Bench** covers more mainstream application domains when compared to existing code
-evaluation benchmarks. Here is a visualization example from FullStack Bench, where the model is tasked with solving problems in the domain of desktop and web development using HTML.
-<p align="center">
-<img src="assets/bench_cases.jpg" width="80%" alt="FullStack Bench" />
-</p>
-
-Refer to our paper or dataset for more details. 
-
-### Results
-<p align="center">
-<img src="assets/result.png" width="100%" alt="results" />
-</p>
-Refer to our paper for more results.
-
-## 📚SandboxFusion
-**SandboxFusion** is an an effective code sandbox execution tool to evaluate different programming tasks from different languages. It incorporates over 10 coding-related evaluation datasets, featuring a standardized data format and accessible via a uniform HTTP API.
-<p align="center">
-<img src="assets/sandbox.png" width="80%" alt="FullStack Bench" />
-</p>
-Refer to our paper and <a href="https://bytedance.github.io/SandboxFusion/">📚 Tutorial </a> for more Details.
-
-## 📊Data
-<div align="center">
-
-| **Dataset** |  **Download** |
-| :------------: | :------------: |
-| FullStack Bench Dataset  | [🤗 HuggingFace](https://huggingface.co/datasets/ByteDance/FullStackBench)   |
-
-</div>
-
-## 💻Usage
-Start the [sandbox server](https://bytedance.github.io/SandboxFusion/):
+## 启动 Sandbox
 
 ```bash
 docker run -d --rm -p 8080:8080 volcengine/sandbox-fusion:server-20241204
 ```
 
-For users in mainland China, the following mirror is provided:
+国内镜像：
 
 ```bash
 docker run -d --rm -p 8080:8080 vemlp-cn-beijing.cr.volces.com/preset-images/code-sandbox:server-20241204
 ```
 
-Then, run the benchmark:
+## 运行
+
+### Anthropic
 
 ```bash
-git clone https://github.com/bytedance/FullStackBench.git
-cd FullStackBench
-pip install -r requirements.txt
-# modify the model configs in src/main.py
-python src/main.py
+python src/main_anthropic.py \
+  --model claude-sonnet-4-6 \
+  --url https://your-api-url \
+  --key sk-xxx \
+  --parallelism 20 \
+  --batch-size 20 \
+  --max-tokens 32000
 ```
-## 📖Citation
-If you find our work helpful, please use the following citations.
+
+### OpenAI
+
+```bash
+python src/main_openai.py \
+  --model gpt-4o \
+  --url https://api.openai.com/v1 \
+  --key sk-xxx \
+  --parallelism 10 \
+  --batch-size 10 \
+  --max-tokens 32000
 ```
-@misc{liu2024fullstackbenchevaluatingllms,
-      title={FullStack Bench: Evaluating LLMs as Full Stack Coders}, 
-      author={Siyao Liu and He Zhu and Jerry Liu and Shulin Xin and Aoyan Li and Rui Long and Li Chen and Jack Yang and Jinxiang Xia and Z. Y. Peng and Shukai Liu and Zhaoxiang Zhang and Ge Zhang and Wenhao Huang and Kai Shen and Liang Xiang},
-      year={2024},
-      eprint={2412.00535},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2412.00535}, 
-}
-```
+
+## 参数说明
+
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--model` | 是 | - | 模型名称 |
+| `--url` | 是 | - | 模型 API base URL |
+| `--key` | 是 | - | API Key |
+| `--parallelism` | 否 | 20 / 10 | 并发数 |
+| `--batch-size` | 否 | 20 / 10 | 批次大小 |
+| `--max-tokens` | 否 | 32000 | 最大输出 token 数 |
+| `--sandbox-url` | 否 | http://localhost:8080 | Sandbox 地址 |
