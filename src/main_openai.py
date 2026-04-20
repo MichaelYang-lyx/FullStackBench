@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import threading
+from pathlib import Path
 from openai import OpenAI
 from sandbox_fusion import (
     SubmitRequest,
@@ -25,6 +27,9 @@ parser.add_argument('--parallelism', type=int, default=10, help='并发数')
 parser.add_argument('--batch-size', type=int, default=10, help='批次大小')
 parser.add_argument('--max-tokens', type=int, default=32000, help='最大 token 数')
 parser.add_argument('--sandbox-url', type=str, default='http://localhost:8080', help='sandbox endpoint')
+parser.add_argument('--output-dir', type=str, default='.', help='结果输出目录')
+parser.add_argument('--temperature', type=float, default=0.6, help='采样温度')
+parser.add_argument('--extra-body', type=str, default='', help='额外请求体 JSON 字符串')
 args = parser.parse_args()
 
 set_endpoint(args.sandbox_url)
@@ -36,19 +41,60 @@ client = OpenAI(
 )
 
 MODEL_NAME = args.model
-FILE_NAME = 'results_' + MODEL_NAME.replace('/', '_') + '.jsonl'
+output_dir = Path(args.output_dir)
+output_dir.mkdir(parents=True, exist_ok=True)
+FILE_NAME = str(output_dir / ('results_' + MODEL_NAME.replace('/', '_') + '.jsonl'))
+TOKEN_STATS_FILE = str(output_dir / 'token_stats.json')
+
+# 解析 extra_body
+extra_body = None
+if args.extra_body:
+    try:
+        extra_body = json.loads(args.extra_body)
+    except Exception:
+        extra_body = None
+
+# 线程安全的 token 统计器
+_token_lock = threading.Lock()
+_token_stats = {
+    'prompt_tokens': 0,
+    'completion_tokens': 0,
+    'total_tokens': 0,
+    'num_requests': 0,
+}
+
+
+def _record_usage(usage):
+    """记录单次请求的 token 用量。"""
+    if usage is None:
+        return
+    with _token_lock:
+        _token_stats['prompt_tokens'] += getattr(usage, 'prompt_tokens', 0) or 0
+        _token_stats['completion_tokens'] += getattr(usage, 'completion_tokens', 0) or 0
+        _token_stats['total_tokens'] += getattr(usage, 'total_tokens', 0) or 0
+        _token_stats['num_requests'] += 1
+
+
+def _save_token_stats():
+    """将 token 统计写入文件。"""
+    with open(TOKEN_STATS_FILE, 'w') as f:
+        json.dump(_token_stats, f, indent=2)
 
 
 @configurable_retry(5)
 def single_inference(prompt: str) -> str:
     for i in range(3):
         try:
-            completion = client.chat.completions.create(
+            kwargs = dict(
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.6,
+                temperature=args.temperature,
                 max_tokens=args.max_tokens,
             )
+            if extra_body:
+                kwargs['extra_body'] = extra_body
+            completion = client.chat.completions.create(**kwargs)
+            _record_usage(completion.usage)
             return completion.choices[0].message.content
         except Exception:
             time.sleep(5)
@@ -137,6 +183,10 @@ def main(output_file, batch_size=10, parallelism=10):
 
     total_pass_rate = sum([r['accepted'] for r in total_results]) / len(total_results)
     print(f'总通过率: {total_pass_rate:.4f}')
+
+    # 保存 token 统计
+    _save_token_stats()
+    print(f"Token 统计已保存到: {TOKEN_STATS_FILE}")
 
 if __name__ == "__main__":
     main(output_file=FILE_NAME, batch_size=args.batch_size, parallelism=args.parallelism)
