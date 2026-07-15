@@ -30,10 +30,14 @@ parser.add_argument('--sandbox-url', type=str, default='http://localhost:8080', 
 parser.add_argument('--output-dir', type=str, default='.', help='结果输出目录')
 parser.add_argument('--temperature', type=float, default=0.6, help='采样温度')
 parser.add_argument('--extra-body', type=str, default='', help='额外请求体 JSON 字符串')
+parser.add_argument('--stream', action='store_true', help='使用流式响应')
+parser.add_argument('--limit', type=int, default=0, help='仅评测前 N 个样本（0 表示全部，用于小样本验证）')
 args = parser.parse_args()
 
 set_endpoint(args.sandbox_url)
 samples = read_jsonl('./data/fsb_en_20241204.jsonl')
+if args.limit and args.limit > 0:
+    samples = samples[:args.limit]
 
 client = OpenAI(
     api_key=args.key,
@@ -44,7 +48,8 @@ MODEL_NAME = args.model
 output_dir = Path(args.output_dir)
 output_dir.mkdir(parents=True, exist_ok=True)
 FILE_NAME = str(output_dir / ('results_' + MODEL_NAME.replace('/', '_') + '.jsonl'))
-TOKEN_STATS_FILE = str(output_dir / 'token_stats.json')
+# token 逐条记录文件：优先用 sb3 注入的环境变量，否则落在 output_dir
+TOKEN_RECORDS_FILE = os.getenv('FSB_TOKEN_RECORDS') or str(output_dir / 'token_records.jsonl')
 
 # 解析 extra_body
 extra_body = None
@@ -54,35 +59,147 @@ if args.extra_body:
     except Exception:
         extra_body = None
 
-# 线程安全的 token 统计器
+# 线程安全的 token 逐条记录写入
 _token_lock = threading.Lock()
-_token_stats = {
-    'prompt_tokens': 0,
-    'completion_tokens': 0,
-    'total_tokens': 0,
-    'num_requests': 0,
-}
+
+# reuse 场景下已写入过 token record 的 sample_id 集合（方案 A：不去重聚合，靠入口过滤防重）
+# main() 启动时预加载现有 token_records.jsonl 中所有带 sample_id 的记录到此 set；
+# _append_token_record 写入前判 skip；写入后加入 set。
+# 老记录若无 sample_id 不进 set，会照常追加（legacy 段全保留，与聚合器口径一致）。
+_written_sample_ids: set = set()
 
 
-def _record_usage(usage):
-    """记录单次请求的 token 用量。"""
-    if usage is None:
+def _preload_written_sample_ids(path: str) -> None:
+    """启动时读取现有 token_records.jsonl，把已有 sample_id 载入 _written_sample_ids。"""
+    if not path or not os.path.exists(path):
         return
-    with _token_lock:
-        _token_stats['prompt_tokens'] += getattr(usage, 'prompt_tokens', 0) or 0
-        _token_stats['completion_tokens'] += getattr(usage, 'completion_tokens', 0) or 0
-        _token_stats['total_tokens'] += getattr(usage, 'total_tokens', 0) or 0
-        _token_stats['num_requests'] += 1
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = rec.get('sample_id')
+                if sid is not None and sid != '':
+                    _written_sample_ids.add(str(sid))
+        if _written_sample_ids:
+            print(f"已加载 {len(_written_sample_ids)} 个 token_records sample_id（跳过重复写入）")
+    except Exception as e:
+        print(f"预加载 token_records sample_id 时出错: {e}（不影响主流程，继续）")
+
+# tiktoken 兜底编码器（API 不给 reasoning_tokens 时用于分别数 think / prediction）
+try:
+    import tiktoken
+    _ENC = tiktoken.get_encoding('cl100k_base')
+except Exception:
+    _ENC = None
 
 
-def _save_token_stats():
-    """将 token 统计写入文件。"""
-    with open(TOKEN_STATS_FILE, 'w') as f:
-        json.dump(_token_stats, f, indent=2)
+def _tiktoken_len(text):
+    if not text or _ENC is None:
+        return 0
+    try:
+        return len(_ENC.encode(text))
+    except Exception:
+        return 0
+
+
+def _split_think(text):
+    """把响应文本拆成 (think_text, prediction_text)，兼容 <think></think>。"""
+    if not text:
+        return '', ''
+    if '</think>' in text:
+        head, _, tail = text.partition('</think>')
+        return head.replace('<think>', ''), tail
+    return '', text
+
+
+def _compute_tokens(usage, text=None, reasoning_text=None):
+    """计算 (input, prediction, think) tokens，口径与 sensebench 对齐。"""
+    def _get(obj, key):
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    input_tokens = completion_tokens = reasoning_tokens = None
+    if usage is not None:
+        input_tokens = _get(usage, 'prompt_tokens')
+        completion_tokens = _get(usage, 'completion_tokens')
+        reasoning_tokens = _get(usage, 'reasoning_tokens')
+        if reasoning_tokens is None:
+            details = _get(usage, 'completion_tokens_details')
+            if details is not None:
+                reasoning_tokens = _get(details, 'reasoning_tokens')
+
+    if reasoning_text:
+        think_text, pred_text = reasoning_text, (text or '')
+    else:
+        think_text, pred_text = _split_think(text)
+
+    # reasoning：usage 有则用；否则用 think 文本 tiktoken 兜底
+    if reasoning_tokens is None or reasoning_tokens == 0:
+        if think_text:
+            think_tokens = _tiktoken_len(think_text)
+            completion_tokens = None  # usage 的 completion 含 reasoning，弃用
+        else:
+            think_tokens = 0
+    else:
+        think_tokens = reasoning_tokens
+        if completion_tokens is not None and completion_tokens >= reasoning_tokens:
+            completion_tokens = completion_tokens - reasoning_tokens
+
+    # prediction：completion 可用则用；否则用 prediction 文本 tiktoken 兜底
+    if completion_tokens is None:
+        prediction_tokens = _tiktoken_len(pred_text) if pred_text else 0
+    else:
+        prediction_tokens = completion_tokens
+    return input_tokens, prediction_tokens, think_tokens
+
+
+def _append_token_record(usage, text, reasoning_text=None, sample_id=None):
+    """向 token_records.jsonl 追加一条记录（含 token 用量与 error/empty 标志）。
+
+    sample_id (v2 新增): 样本唯一 id。方案 A 场景下：
+      - 有 sample_id 且已在 _written_sample_ids 中 → skip（防止 reuse 补跑时重复写）
+      - 有 sample_id 且未写过 → 写入并加入 set
+      - 无 sample_id (legacy) → 照常写入（不参与去重）
+    """
+    try:
+        sid_str = str(sample_id) if sample_id is not None else None
+        # 加锁一次性检查+写入，保证并发下 set 与文件严格一致
+        with _token_lock:
+            if sid_str is not None and sid_str in _written_sample_ids:
+                return
+            input_tokens, prediction_tokens, think_tokens = _compute_tokens(
+                usage, text=text, reasoning_text=reasoning_text
+            )
+            stripped = (text or '').strip()
+            is_empty = stripped == ''
+            is_error = stripped.upper().startswith('ERROR')
+            rec = {
+                'input_tokens': input_tokens,
+                'prediction_tokens': prediction_tokens,
+                'think_tokens': think_tokens,
+                'is_error': is_error,
+                'is_empty': is_empty,
+            }
+            if sid_str is not None:
+                rec['sample_id'] = sid_str
+            line = json.dumps(rec, ensure_ascii=False)
+            with open(TOKEN_RECORDS_FILE, 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+            if sid_str is not None:
+                _written_sample_ids.add(sid_str)
+    except Exception:
+        pass
 
 
 @configurable_retry(5)
-def single_inference(prompt: str) -> str:
+def single_inference(prompt: str, sample_id=None) -> str:
     for i in range(3):
         try:
             kwargs = dict(
@@ -93,16 +210,45 @@ def single_inference(prompt: str) -> str:
             )
             if extra_body:
                 kwargs['extra_body'] = extra_body
+            if args.stream:
+                # 流式：逐 chunk 累加 content / reasoning_content，并通过 stream_options 拿到最终 usage
+                kwargs['stream'] = True
+                kwargs['stream_options'] = {"include_usage": True}
+                completion = client.chat.completions.create(**kwargs)
+                pieces = []
+                reasoning_pieces = []
+                final_usage = None
+                for chunk in completion:
+                    # 带 usage 的最终 chunk 通常 choices 为空
+                    if getattr(chunk, 'usage', None):
+                        final_usage = chunk.usage
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta
+                        piece = getattr(delta, 'content', None)
+                        if piece:
+                            pieces.append(piece)
+                        r_piece = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
+                        if r_piece:
+                            reasoning_pieces.append(r_piece)
+                text = "".join(pieces)
+                reasoning_text = "".join(reasoning_pieces) or None
+                _append_token_record(final_usage, text, reasoning_text, sample_id=sample_id)
+                return text
             completion = client.chat.completions.create(**kwargs)
-            _record_usage(completion.usage)
-            return completion.choices[0].message.content
+            msg = completion.choices[0].message
+            text = msg.content
+            reasoning_text = getattr(msg, 'reasoning_content', None) or getattr(msg, 'reasoning', None)
+            _append_token_record(completion.usage, text, reasoning_text, sample_id=sample_id)
+            return text
         except Exception:
             time.sleep(5)
             continue
+    # 三次都失败：记一条 error 记录（仍带 sample_id，reuse 覆盖旧记录时才能对上）
+    _append_token_record(None, "ERROR: inference failed", sample_id=sample_id)
     return "error"
 
 def process_sample(sample):
-    raw_response = single_inference(sample['content'])
+    raw_response = single_inference(sample['content'], sample_id=sample.get('id'))
     if not raw_response:
         raw_response = ''
     if '</think>' in raw_response:
@@ -142,6 +288,9 @@ def process_batch(batch, parallelism, output_file):
     return results
 
 def main(output_file, batch_size=10, parallelism=10):
+    # 方案 A：预加载已有 token_records.jsonl 中的 sample_id，防止 reuse 补跑时重复写入
+    _preload_written_sample_ids(TOKEN_RECORDS_FILE)
+
     processed_ids = set()
 
     if os.path.exists(output_file):
@@ -184,9 +333,7 @@ def main(output_file, batch_size=10, parallelism=10):
     total_pass_rate = sum([r['accepted'] for r in total_results]) / len(total_results)
     print(f'总通过率: {total_pass_rate:.4f}')
 
-    # 保存 token 统计
-    _save_token_stats()
-    print(f"Token 统计已保存到: {TOKEN_STATS_FILE}")
+    print(f"Token 逐条记录已写入: {TOKEN_RECORDS_FILE}")
 
 if __name__ == "__main__":
     main(output_file=FILE_NAME, batch_size=args.batch_size, parallelism=args.parallelism)
